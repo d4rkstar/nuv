@@ -1,5 +1,5 @@
 #!/usr/bin/env nix-shell
-#! nix-shell -i bash -p nix-prefetch-git -p jq -p nix -p go
+#! nix-shell -i bash -p nix-prefetch-git -p jq -p nix -p go -p cachix
 
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -17,6 +17,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+#
 
 # Default values
 # Define the repository information
@@ -29,7 +30,6 @@ INIT_DIR=$(pwd)
 
 cleanup() {
   echo "Removing $BUILD_DIR"
-  rm -f "$BUILD_DIR/$REPO.nix" "$BUILD_DIR/default.nix"
   rm -rf "$BUILD_DIR"
 }
 
@@ -124,16 +124,18 @@ in
 pkgs.mkShell {
   buildInputs = [
     nuv
+    pkgs.openssh
+    pkgs.curl
   ];
 }
 EOM
-
 
 # Generate the Nix expression template
 read -r -d '' NIX_EXPRESSION << EOM
 { lib
 , stdenv
-, pkgs
+, symlinkJoin
+, callPackage
 , fetchFromGitHub
 , fetchurl
 , buildGoModule
@@ -141,27 +143,20 @@ read -r -d '' NIX_EXPRESSION << EOM
 , breakpointHook
 , jq
 , curl
-, kubectl 
-, eksctl 
-, kind 
-, k3sup 
+, kubectl
+, eksctl
+, kind
+, k3sup
 , coreutils
 }:
 
-let 
-   branch = "3.0.0";
-   version = "$REV";
-in buildGoModule rec {
-
+let
+  branch = "3.0.0";
+  version = "$REV";
   pname = "nuv";
-
-  inherit branch version;
-
-  nativeBuildInputs = [ makeWrapper jq curl breakpointHook ] ;
-
-  buildInputs = [ kubectl eksctl kind k3sup coreutils ];
-
-  subPackages = ["."];
+in
+buildGoModule {
+  inherit pname version;
 
   src = fetchFromGitHub {
     owner = "$OWNER";
@@ -169,31 +164,50 @@ in buildGoModule rec {
     rev = "$REV";
     sha256 = "$SHA256";    
   };
-  
+
+  subPackages = [ "." ];
   vendorHash = "$VENDOR_HASH";
 
-  doCheck = false; 
+  nativeBuildInputs = [ makeWrapper jq curl breakpointHook ];
 
-  ldflags =  [
-    "-X main.NuvVersion=${version}"
-    "-X main.NuvBranch=${branch}"
+  buildInputs = [ kubectl eksctl kind k3sup coreutils ];
+
+  ldflags = [
+    "-s"
+    "-w"
+    "-X main.NuvVersion=\${version}"
+    "-X main.NuvBranch=\${branch}"
   ];
 
-  meta = with lib; {
-    description = "Nuvolaris Almighty CLI tool";
-    license = licenses.asl20;
-    homepage = "https://nuvolaris.io/";
-    maintainers = with maintainers; [ msciabarra d4rkstar ];
-    mainProgram = "nuv";
+  # false because tests require some modifications inside nix-env
+  doCheck = false;
+
+  postInstall = let
+    nuv-bin = symlinkJoin {
+      name = "nuv-bin";
+      paths = [
+        coreutils
+        kubectl
+        eksctl
+        kind
+        k3sup
+      ];
+    };
+  in ''
+    wrapProgram \$out/bin/nuv --set NUV_BIN "\${nuv-bin}/bin"
+  '';
+
+  passthru.tests = {
+    simple = callPackage ./tests.nix { inherit version; };
   };
 
-  postInstall  = ''
-    makeWrapper \${coreutils}/bin/coreutils \$out/bin/coreutils
-    makeWrapper \${kubectl}/bin/kubectl \$out/bin/kubectl
-    makeWrapper \${eksctl}/bin/eksctl \$out/bin/eksctl
-    makeWrapper \${kind}/bin/kind \$out/bin/kind
-    makeWrapper \${k3sup}/bin/k3sup \$out/bin/k3sup
-  '';
+  meta = {
+    homepage = "https://nuvolaris.io/";
+    description = "A CLI tool for running tasks using the Nuvolaris serverless engine";
+    license = lib.licenses.asl20;
+    mainProgram = "nuv";
+    maintainers = with lib.maintainers; [ msciabarra d4rkstar ];
+  };
 }
 EOM
 
